@@ -1,7 +1,7 @@
+{-# LANGUAGE ApplicativeDo     #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ApplicativeDo #-}
-{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE TupleSections     #-}
 
 module Data.Configured where
 
@@ -16,11 +16,11 @@ import           Control.Concurrent.STM.TVar (TVar, modifyTVar, newTVarIO,
                                               writeTVar)
 import           Control.Exception           (catch, throwIO)
 import           Control.Lens                (to, view, (%~), (^.))
-import           Control.Monad               (forever, void, (<=<), (=<<),
+import           Control.Monad               (forever, join, void, (<=<), (=<<),
                                               (>=>), (>>), (>>=))
 import           Control.Monad.IO.Class      (MonadIO, liftIO)
 import           Control.Monad.STM           (STM, atomically)
-import           Data.Bool                   (Bool, bool)
+import           Data.Bool                   (Bool (False), bool, (||))
 import           Data.Configured.Types       (AutoConfig (AutoConfig),
                                               ChangeHandler, Config (Config),
                                               Configured, KeyError (KeyError),
@@ -28,13 +28,15 @@ import           Data.Configured.Types       (AutoConfig (AutoConfig),
                                               Value, Worth (Optional, Required),
                                               conf, convert, group, handlers,
                                               interval, onError, paths)
-import           Data.Foldable               (fold)
+import           Data.Eq                     ((==))
+import           Data.Foldable               (fold, foldr, traverse_)
 import           Data.Function               (const, flip, id, ($), (&), (.))
 import           Data.Functor                (fmap, (<$>))
 import           Data.HashMap.Strict         (HashMap)
 import qualified Data.HashMap.Strict         as Map
 import           Data.List                   (nub)
-import           Data.Maybe                  (Maybe (Just), fromMaybe, maybe)
+import           Data.Maybe                  (Maybe (Just, Nothing), fromMaybe,
+                                              maybe)
 import           Data.Monoid                 (mempty)
 import           Data.Semigroup              (Semigroup, (<>))
 import qualified Data.Text                   as T
@@ -88,7 +90,7 @@ exact :: T.Text -> Pattern
 exact = Exact
 
 subscribe :: MonadIO m => Config -> Pattern -> ChangeHandler -> m ()
-subscribe c p h = atomicallyM $ modifyTVar (c ^. handlers) ((p, h) :)
+subscribe c p h = atomicallyM . modifyTVar (c ^. handlers) . Map.insertWith (<>) p $ pure h
 
 
 
@@ -123,7 +125,7 @@ loadGroups :: MonadIO m => [(Name, Worth FilePath)] -> m Config
 loadGroups l = Config mempty
   <$> liftIO (newTVarIO l)
   <*> (traverse readConfig l >>= liftIO . newTVarIO . fold)
-  <*> liftIO (newTVarIO [])
+  <*> liftIO (newTVarIO mempty)
 
 reload :: MonadIO m => Config -> m ()
 reload c = do
@@ -132,8 +134,34 @@ reload c = do
   atomicallyM $ writeTVar (c ^. paths) l >> writeTVar (c ^. conf) new
   runHandlers c new old
 
+matches :: Name -> Pattern -> Bool
+matches n (Exact p)  = p == n
+matches n (Prefix p) = fromMaybe False $ (\t -> t == mempty || T.isPrefixOf "." t) <$> T.stripPrefix p n
+
+applyHandlers :: MonadIO m => Name -> Maybe Value -> [ChangeHandler] -> m ()
+applyHandlers n v = liftIO . traverse_ (\h -> h n v)
+
+matchingHandlers :: Name -> HashMap Pattern [ChangeHandler] -> [ChangeHandler]
+matchingHandlers n = join . Map.elems . Map.filterWithKey (\k -> const $ matches n k)
+
 runHandlers :: MonadIO m => Config -> HashMap Name Value -> HashMap Name Value -> m ()
-runHandlers = undefined
+runHandlers c new old = atomicallyM (readTVar $ c ^. handlers) >>= f
+  where
+    f :: MonadIO m => HashMap Pattern [ChangeHandler] -> m ()
+    f m = traverse_ (\(n, v) -> applyHandlers n v $ matchingHandlers n m) diffList
+
+    keys :: [Name]
+    keys = nub $ Map.keys new <> Map.keys old
+
+    diffList :: [(Name, Maybe Value)]
+    diffList = foldr (\n l -> maybe l (\v -> (n, v) : l) $ diff n) mempty keys
+    
+    diff :: Name -> Maybe (Maybe Value)
+    diff n = case (Map.lookup n new, Map.lookup n old) of
+      (Nothing, Nothing) -> Nothing
+      (Just a, Nothing)  -> Just $ Just a
+      (Nothing, Just _)  -> Just Nothing
+      (Just a, Just b)   -> bool (Just $ Just a) Nothing $ a == b
 
 subconfig :: Name -> Config -> Config
 subconfig n c = c & group %~ (<> "." <> n)

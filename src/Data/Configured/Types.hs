@@ -77,7 +77,7 @@ data Config = Config
   { _group    :: Name
   , _paths    :: TVar [(Name, Worth FilePath)]
   , _conf     :: TVar (HashMap Name Value)
-  , _handlers :: TVar [(Pattern, ChangeHandler)]
+  , _handlers :: TVar (HashMap Pattern [ChangeHandler])
   }
 makeLenses ''Config
 
