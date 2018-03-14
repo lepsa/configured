@@ -18,34 +18,36 @@ import           Data.Semigroup
 import qualified Data.Text               as T
 import           Text.Parser.Char
 import           Text.Parser.Combinators
+import           Text.Parser.Token
 import           Text.Read               (readMaybe)
 import           Text.Trifecta.Parser
 
-type ConfigParser m = (MonadIO m, Monad m, CharParsing m)
+type ConfigParser m = (MonadIO m, Monad m, CharParsing m, TokenParsing m)
 
 import' :: ConfigParser m => m [(Name, Value)]
-import' = do
-  string "import" *> spaces
-  undefined
+import' = symbol "import" *> undefined
 
 name :: ConfigParser m => m Name
-name = (\c s -> T.cons c $ T.pack s)
-  <$> satisfy isAlpha
-  <*> many (satisfy (\e -> isAlpha e || e == '-' || e == '_'))
+name = (\c -> T.cons c . T.pack)
+  <$> letter
+  <*> many (letter <|> oneOf "_-")
+  <?> "identifier"
 
 value :: ConfigParser m => m Value
 value = vBool <|> vString <|> vNumber <|> vList
 
-vBool :: CharParsing m => m Value
+vBool :: ConfigParser m => m Value
 vBool = fmap Bool $ (const True <$> string "true")
     <|> (const False <$> string "false")
     <|> onOff
+    <?> "bool"
   where
-    onOff :: CharParsing m => m Bool
+    onOff :: ConfigParser m => m Bool
     onOff = char 'o' *> ((const True <$> char 'n') <|> (const False <$> string "ff"))
 
-
-escape :: CharParsing m => m ()
+-- Sadly I can't use the stringLiteral token here. Configurator has a different
+-- unicode code-point escape scheme.
+escape :: ConfigParser m => m ()
 escape = void $ char '\\'
 
 escapedChar :: ConfigParser m => m Char
@@ -77,7 +79,7 @@ surrogate = do
   d <- digitToInt <$> satisfy isHexDigit
   pure $ hexToInt a b c d
 
-hex :: CharParsing m => m Int
+hex :: ConfigParser m => m Int
 hex = char 'u' *> hexes
   where
     hex'  = digitToInt <$> satisfy isHexDigit
@@ -98,61 +100,38 @@ unicode = do
     $ isSurrogate h
 
 -- Ensure that we aren't picking up characters that are meant to be escaped.
-unescapedChar :: CharParsing m => m Char
+unescapedChar :: ConfigParser m => m Char
 unescapedChar = satisfy $ flip notElem ['\n', '\r', '\t', '\\', '"']
 
 stringChar :: ConfigParser m => m Char
 stringChar = escapedChar <|> unescapedChar
 
-stringStart :: CharParsing m => m ()
+stringStart :: ConfigParser m => m ()
 stringStart = void $ char '"'
 
-stringEnd :: CharParsing m => m ()
+stringEnd :: ConfigParser m => m ()
 stringEnd = stringStart
 
 vString :: ConfigParser m => m Value
-vString = between stringStart stringEnd $ String . T.pack <$> many stringChar
+vString = between stringStart stringEnd $ String . T.pack <$> many stringChar <?> "string"
 
-vNumber :: CharParsing m => m Value
-vNumber = Number . foldl f 0 <$> some digit
-  where
-    f z a = z * 10 + (fromIntegral . toInteger $ digitToInt a)
-
-listStart :: CharParsing m => m ()
-listStart = void $ char '['
-
-listEnd :: CharParsing m => m ()
-listEnd = void $ char ']'
-
-listSeparator :: CharParsing m => m ()
-listSeparator = void $ char ','
+vNumber :: ConfigParser m => m Value
+vNumber = Number . fromInteger <$> integer <?> "number"
 
 vList :: ConfigParser m => m Value
-vList = between listStart listEnd $ List <$> sepBy value listSeparator
-
-valueBindChar :: Char
-valueBindChar = '='
+vList = brackets $ List <$> commaSep value
 
 valueBind :: ConfigParser m => Name -> m (Name, Value)
-valueBind n = (n,) <$> (char valueBindChar *> value)
-
-groupStart :: CharParsing m => m ()
-groupStart = void $ char '{'
-
-groupEnd :: CharParsing m => m ()
-groupEnd = void $ char '}'
+valueBind n = (n,) <$> (symbolic '=' *> value)
 
 prefixGroup :: Name -> Name -> Name
 prefixGroup g n = (g <> "." <> n)
 
 groupBind :: ConfigParser m => Name -> m [(Name, Value)]
-groupBind g = between groupStart groupEnd $ (each . _1 %~ prefixGroup g) . join <$> many boundValueOrGroup
+groupBind g = braces $ (each . _1 %~ prefixGroup g) . join <$> many boundValueOrGroup
 
 boundValueOrGroup :: ConfigParser m => m [(Name, Value)]
 boundValueOrGroup = name >>= \n -> (pure <$> valueBind n) <|> groupBind n
 
-commentChar :: Char
-commentChar = '#'
-
-comment :: CharParsing m => m ()
-comment = char commentChar *> void (manyTill anyChar $ char '\n')
+comment :: ConfigParser m => m ()
+comment = symbolic '#' *> void (manyTill anyChar $ char '\n')
