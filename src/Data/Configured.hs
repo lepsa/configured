@@ -2,6 +2,7 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TupleSections     #-}
+{-# LANGUAGE LambdaCase #-}
 
 module Data.Configured where
 
@@ -9,7 +10,7 @@ module Data.Configured where
 -- When I make the API nicer, one of the first things will be
 -- to add error types and MonadExcept
 
-import           Control.Applicative         (liftA2, pure, (<*>))
+import           Control.Applicative         (liftA2, pure, (<*>), (*>))
 import           Control.Concurrent          (ThreadId, forkIO, threadDelay)
 import           Control.Concurrent.STM.TVar (TVar, modifyTVar, newTVarIO,
                                               readTVar, readTVarIO, swapTVar,
@@ -17,7 +18,7 @@ import           Control.Concurrent.STM.TVar (TVar, modifyTVar, newTVarIO,
 import           Control.Exception           (catch, throwIO)
 import           Control.Lens                (to, view, (%~), (^.))
 import           Control.Monad               (forever, join, void, (<=<), (=<<),
-                                              (>=>), (>>), (>>=))
+                                              (>=>), (>>=))
 import           Control.Monad.IO.Class      (MonadIO, liftIO)
 import           Control.Monad.STM           (STM, atomically)
 import           Data.Bool                   (Bool (False), bool, (||))
@@ -41,9 +42,11 @@ import           Data.Monoid                 (mempty)
 import           Data.Semigroup              (Semigroup, (<>))
 import qualified Data.Text                   as T
 import           Data.Traversable            (traverse)
-import           Prelude                     (undefined)
+import           Prelude                     (undefined, error, show)
 import           System.IO                   (FilePath, print)
 import           System.IO.Unsafe            (unsafePerformIO)
+import Text.Trifecta.Result (Result (Success, Failure))
+import Text.Trifecta (parseFromFileEx)
 
 -- TODO: `require` should probably be a MonadError over IO/MonadIO
 
@@ -55,7 +58,7 @@ autoReload ac = autoReloadGroups ac . addRootGroup
 autoReloadGroups :: MonadIO m => AutoConfig -> [(Name, Worth FilePath)] -> m (Config, ThreadId)
 autoReloadGroups ac l = do
   c <- loadGroups l
-  t <- liftIO . forkIO . catch (forever $ threadDelay (interval ac) >> reload c) $ onError ac
+  t <- liftIO . forkIO . catch (forever $ threadDelay (interval ac) *> reload c) $ onError ac
   pure (c, t)
 
 autoConfig :: AutoConfig
@@ -71,7 +74,7 @@ empty' = liftIO $ Config mempty <$> newTVarIO mempty <*> newTVarIO mempty <*> ne
 
 -- Lookup functions
 lookup :: (MonadIO m, Configured a) => Config -> Name -> m (Maybe a)
-lookup c n = liftIO $ (convert <=< Map.lookup n) <$> getMap c
+lookup c n = (convert <=< Map.lookup n) <$> getMap c
 
 lookupDefault :: (MonadIO m, Configured a) => a -> Config -> Name -> m a
 lookupDefault a c = fmap (fromMaybe a) . lookup c
@@ -95,25 +98,15 @@ subscribe c p h = atomicallyM . modifyTVar (c ^. handlers) . Map.insertWith (<>)
 
 
 -- Low level loading
-{-
--- Merge the right set of config into the left config
--- Biased to left values. I hope you like STM!
-merge :: MonadIO m => Config -> Config -> m Config
-merge c = atomicallyM . merge' c
-
-merge' :: Config -> Config -> STM Config
-merge' (Config ag ap ac ah) (Config ag bp bc bh) = do
-  void $ f nub ap bp >> f id ac bc >> f id ah bh
-  pure $ Config _ ap ac ah
-  where
-    f :: Semigroup a => (a -> a) -> TVar a -> TVar a -> STM a
-    f f' a b = liftA2 (<>) (readTVar a) (readTVar b) >>= swapTVar a . f'
--}
-
+-- Load the config into a "namespace"
 readConfig :: MonadIO m => (Name, Worth FilePath) -> m (HashMap Name Value)
 readConfig (n, w) = alterNames (Just . (n <>)) <$> case w of
-  Optional fp -> undefined fp
-  Required fp -> undefined fp
+  Optional fp -> parseFromFileEx undefined fp >>= \case
+    (Success a) -> pure a
+    _           -> pure mempty
+  Required fp -> parseFromFileEx undefined fp >>= \case
+    (Success a) -> pure a
+    (Failure e) -> error $ show e
 
 addRootGroup :: [Worth FilePath] -> [(Name, Worth FilePath)]
 addRootGroup = fmap (mempty,)
@@ -129,11 +122,16 @@ loadGroups l = Config mempty
 
 reload :: MonadIO m => Config -> m ()
 reload c = do
-  (l, old) <- atomicallyM $ (,) <$> readTVar (c ^. paths) <*> readTVar (c ^. conf)
+  l   <- atomicallyM . readTVar $ c ^. paths
+  old <- atomicallyM . readTVar $ c ^. conf
   new <- fold <$> traverse readConfig l
-  atomicallyM $ writeTVar (c ^. paths) l >> writeTVar (c ^. conf) new
+  atomicallyM $ writeTVar (c ^. conf) new
   runHandlers c new old
 
+-- If we can strip off the prefix and end up with an empty string or a string
+-- that begins with ".", then we have a match. We cannot use
+-- Data.Text.isPrefixOf without extra checks, as (Prefix "asd") will incorrectly
+-- match on "asdfgh"
 matches :: Name -> Pattern -> Bool
 matches n (Exact p)  = p == n
 matches n (Prefix p) = fromMaybe False $ (\t -> t == mempty || T.isPrefixOf "." t) <$> T.stripPrefix p n
@@ -156,21 +154,24 @@ runHandlers c new old = atomicallyM (readTVar $ c ^. handlers) >>= f
     diffList :: [(Name, Maybe Value)]
     diffList = foldr (\n l -> maybe l (\v -> (n, v) : l) $ diff n) mempty keys
     
+    -- Diff values.
+    -- If the values are the same we return Nothing and the handlers are skipped.
+    -- If there is a diff, we return the new in a Just, or show a deletion with Nothing
     diff :: Name -> Maybe (Maybe Value)
     diff n = case (Map.lookup n new, Map.lookup n old) of
       (Nothing, Nothing) -> Nothing
-      (Just a, Nothing)  -> Just $ Just a
-      (Nothing, Just _)  -> Just Nothing
-      (Just a, Just b)   -> bool (Just $ Just a) Nothing $ a == b
+      (Just a, Nothing)  -> pure $ pure a
+      (Nothing, Just _)  -> pure Nothing
+      (Just a, Just b)   -> bool (pure $ pure a) Nothing $ a == b
 
 subconfig :: Name -> Config -> Config
-subconfig n c = c & group %~ (<> "." <> n)
+subconfig n = group %~ (<> "." <> n)
 
 addToConfig :: MonadIO m => [Worth FilePath] -> Config -> m ()
 addToConfig l = addGroupsToConfig (addRootGroup l)
 
 addGroupsToConfig :: MonadIO m => [(Name, Worth FilePath)] -> Config -> m ()
-addGroupsToConfig l c = atomicallyM (flip modifyTVar (<> l) $ c ^. paths) >> reload c
+addGroupsToConfig l c = atomicallyM (flip modifyTVar (<> l) $ c ^. paths) *> reload c
 
 
 
@@ -184,10 +185,10 @@ display = getMap >=> liftIO . print
 
 -- If f returns Nothing, the value is dropped, else it is inserted with the modification.
 alterNames :: (Name -> Maybe Name) -> HashMap Name Value -> HashMap Name Value
-alterNames f = Map.foldrWithKey (g . f) mempty
+alterNames f = Map.foldrWithKey g mempty
   where
-    g :: Maybe Name -> Value -> HashMap Name Value -> HashMap Name Value
-    g n v m = maybe m (\k -> Map.insert k v m) n
+    g :: Name -> Value -> HashMap Name Value -> HashMap Name Value
+    g n v m = maybe (Map.delete n m) (\k -> Map.insert k v m) $ f n
 
 getMap :: MonadIO m => Config -> m (HashMap Name Value)
 getMap c = alterNames (T.stripPrefix $ c ^. group) <$> atomicallyM (readTVar $ c ^. conf)

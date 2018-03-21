@@ -47,6 +47,8 @@ import           Text.Show                   (Show, show)
 
 type Name = T.Text
 
+newtype Import = Import T.Text
+
 data AutoConfig = AutoConfig { interval :: Int -- Time in seconds to check for updates
                              , onError  :: SomeException -> IO () -- Action on reload or change error.
                              } deriving (Typeable)
